@@ -213,5 +213,34 @@ async function testCordisLifecycle() {
   console.log("✔ Cordis Service Interception & Unpatch Lifecycle passed");
 }
 
+// Test 9: Read-only / Frozen Object Protection Test
+async function testReadOnlyProtection() {
+  const frozenPrepared = Object.freeze({
+    stream(options) {
+      return "original stream";
+    }
+  });
+
+  const mockLlm = {
+    async prepareCall(config) {
+      return frozenPrepared;
+    }
+  };
+
+  const app = new Context();
+  app.llm = mockLlm;
+
+  const service = new MultimodalBridgeService(app, {});
+  service.install();
+
+  // Call prepareCall on frozen object - should return proxy without throwing Cannot assign to read only property 'stream'
+  const prepared = await mockLlm.prepareCall({});
+  assert.ok(typeof prepared.stream === "function");
+  const res = prepared.stream({});
+  assert.equal(res, "original stream");
+  console.log("✔ Read-only / Frozen Object Protection passed");
+}
+
 await testCordisLifecycle();
-console.log("\nALL 8 MULTIMODAL BRIDGE TEST SUITES PASSED! 🎉");
+await testReadOnlyProtection();
+console.log("\nALL 9 MULTIMODAL BRIDGE TEST SUITES PASSED! 🎉");
