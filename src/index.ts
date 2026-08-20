@@ -35,8 +35,9 @@ export class MultimodalBridgeService extends Service {
 
   private unpatchers: (() => void)[] = [];
 
-  constructor(ctx: Context, public config: MultimodalBridgeConfig) {
+  constructor(ctx: Context, public config: MultimodalBridgeConfig = {}) {
     super(ctx, "multimodal-bridge", true);
+    this.install();
   }
 
   public install() {
@@ -98,94 +99,191 @@ export class MultimodalBridgeService extends Service {
     const llm = (this.ctx as any)?.llm;
     if (!llm) return;
 
-    // 1. Hook llm.stream to dynamically project messages right before LLM dispatch
-    if (typeof llm.stream === "function") {
-      const originalStream = llm.stream.bind(llm);
-      const patchedStream = (options: any) => {
-        if (options && Array.isArray(options.messages)) {
-          const provider = options.provider || "";
-          const model = options.model || "";
-          const isVision = this.supportsVision(provider, model);
+    const self = this;
 
-          if (!isVision && options.messages.some((m: any) => contentHasImage(m.content))) {
-            const projected = projectMessagesForTarget(options.messages, false, {
-              placeholderTemplate: this.config.placeholderTemplate,
-              preserveCaptions: this.config.preserveCaptions
-            });
-            options = {
-              ...options,
-              messages: projected
-            };
-          }
-        }
-        return originalStream(options);
-      };
+    // Collect all targets in prototype chain + target instance itself to cover:
+    // (1) Mock plain objects in unit tests (`{ resolveModelInfo: ... }`)
+    // (2) Cordis Service Proxy instances in live DSH (`llm.constructor.prototype` & `Object.getPrototypeOf(llm)`)
+    const targets: any[] = [];
+    if (llm) targets.push(llm);
 
-      llm.stream = patchedStream;
-      this.unpatchers.push(() => {
-        llm.stream = originalStream;
-      });
+    const proto = Object.getPrototypeOf(llm);
+    if (proto && proto !== Object.prototype) {
+      targets.push(proto);
+    }
+    if (llm.constructor?.prototype && llm.constructor.prototype !== Object.prototype && !targets.includes(llm.constructor.prototype)) {
+      targets.push(llm.constructor.prototype);
     }
 
-    // 2. Hook prepareCall if present
-    if (typeof llm.prepareCall === "function") {
-      const originalPrepareCall = llm.prepareCall.bind(llm);
-      const patchedPrepareCall = async (config: any, signal?: any) => {
-        const prepared = await originalPrepareCall(config, signal);
-        if (prepared && typeof prepared.stream === "function") {
-          const origPreparedStream = prepared.stream.bind(prepared);
-          prepared.stream = (options: any) => {
-            if (options && Array.isArray(options.messages)) {
-              const provider = options.provider || config.provider || "";
-              const model = options.model || config.model || "";
-              const isVision = this.supportsVision(provider, model);
+    const patchMethodOnObject = (
+      obj: any,
+      prop: string,
+      wrapperFactory: (origMethod: Function) => Function
+    ) => {
+      if (!obj) return;
+      let original: any;
+      try {
+        original = obj[prop];
+      } catch {
+        return;
+      }
+      if (typeof original !== "function") return;
+      const wrapped = wrapperFactory(original);
 
-              if (!isVision && options.messages.some((m: any) => contentHasImage(m.content))) {
-                const projected = projectMessagesForTarget(options.messages, false, {
-                  placeholderTemplate: this.config.placeholderTemplate,
-                  preserveCaptions: this.config.preserveCaptions
+      let patched = false;
+      try {
+        obj[prop] = wrapped;
+        patched = true;
+      } catch {
+        try {
+          const desc = Object.getOwnPropertyDescriptor(obj, prop);
+          Object.defineProperty(obj, prop, {
+            configurable: true,
+            writable: true,
+            enumerable: desc ? desc.enumerable : true,
+            value: wrapped,
+          });
+          patched = true;
+        } catch {
+          const p = Object.getPrototypeOf(obj);
+          if (p && p !== Object.prototype) {
+            try {
+              const pDesc = Object.getOwnPropertyDescriptor(p, prop);
+              Object.defineProperty(p, prop, {
+                configurable: true,
+                writable: true,
+                enumerable: pDesc ? pDesc.enumerable : true,
+                value: wrapped,
+              });
+              patched = true;
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+
+      if (patched) {
+        self.unpatchers.push(() => {
+          try {
+            obj[prop] = original;
+          } catch {
+            try {
+              Object.defineProperty(obj, prop, { value: original });
+            } catch {
+              // ignore
+            }
+          }
+        });
+      }
+    };
+
+    for (const target of targets) {
+      // 1. Hook stream
+      patchMethodOnObject(target, "stream", (originalStream) => {
+        return function(this: any, options: any) {
+          if (options && Array.isArray(options.messages)) {
+            const provider = options.provider || "";
+            const model = options.model || "";
+            const isVision = self.supportsVision(provider, model);
+
+            if (!isVision && options.messages.some((m: any) => contentHasImage(m.content))) {
+              const projected = projectMessagesForTarget(options.messages, false, {
+                placeholderTemplate: self.config.placeholderTemplate,
+                preserveCaptions: self.config.preserveCaptions
+              });
+              options = {
+                ...options,
+                messages: projected
+              };
+            }
+          }
+          return originalStream.call(this, options);
+        };
+      });
+
+      // 2. Hook prepareCall if present
+      patchMethodOnObject(target, "prepareCall", (originalPrepareCall) => {
+        return async function(this: any, config: any, signal?: any) {
+          const prepared = await originalPrepareCall.call(this, config, signal);
+          if (prepared && typeof prepared.stream === "function") {
+            const origPreparedStream = prepared.stream;
+            const wrappedPreparedStream = function(this: any, options: any) {
+              if (options && Array.isArray(options.messages)) {
+                const provider = options.provider || config?.provider || "";
+                const model = options.model || config?.model || "";
+                const isVision = self.supportsVision(provider, model);
+
+                if (!isVision && options.messages.some((m: any) => contentHasImage(m.content))) {
+                  const projected = projectMessagesForTarget(options.messages, false, {
+                    placeholderTemplate: self.config.placeholderTemplate,
+                    preserveCaptions: self.config.preserveCaptions
+                  });
+                  options = {
+                    ...options,
+                    messages: projected
+                  };
+                }
+              }
+              return origPreparedStream.call(this, options);
+            };
+
+            // Try direct mutation or defineProperty first
+            try {
+              prepared.stream = wrappedPreparedStream;
+              return prepared;
+            } catch {
+              try {
+                const desc = Object.getOwnPropertyDescriptor(prepared, "stream");
+                Object.defineProperty(prepared, "stream", {
+                  configurable: true,
+                  writable: true,
+                  enumerable: desc ? desc.enumerable : true,
+                  value: wrappedPreparedStream,
                 });
-                options = {
-                  ...options,
-                  messages: projected
+                return prepared;
+              } catch {
+                // Target is frozen/read-only: use Proxy with an empty object target to avoid Proxy Invariants
+                return new Proxy({}, {
+                  get(_t, prop, receiver) {
+                    if (prop === "stream") return wrappedPreparedStream;
+                    const val = Reflect.get(prepared, prop);
+                    return typeof val === "function" ? val.bind(prepared) : val;
+                  },
+                  has(_t, prop) {
+                    if (prop === "stream") return true;
+                    return prop in prepared;
+                  }
+                });
+              }
+            }
+          }
+          return prepared;
+        };
+      });
+
+      // 3. Patch resolveModelInfo if present
+      if (this.config.bypassAdmissionLock ?? true) {
+        patchMethodOnObject(target, "resolveModelInfo", (origResolveModelInfo) => {
+          return async function(this: any, provider: string, model: string, signal?: any) {
+            const info = await origResolveModelInfo.call(this, provider, model, signal);
+            if (info && Array.isArray(info.inputModalities)) {
+              if (!info.inputModalities.includes("image")) {
+                return {
+                  ...info,
+                  inputModalities: [...info.inputModalities, "image"]
                 };
               }
             }
-            return origPreparedStream(options);
+            return info;
           };
-        }
-        return prepared;
-      };
-
-      llm.prepareCall = patchedPrepareCall;
-      this.unpatchers.push(() => {
-        llm.prepareCall = originalPrepareCall;
-      });
-    }
-
-    // 3. Patch resolveModelInfo to gracefully allow image admission when bypassAdmissionLock is true
-    if (typeof llm.resolveModelInfo === "function" && this.config.bypassAdmissionLock) {
-      const origResolveModelInfo = llm.resolveModelInfo.bind(llm);
-      const patchedResolveModelInfo = async (provider: string, model: string, signal?: any) => {
-        const info = await origResolveModelInfo(provider, model, signal);
-        if (info && Array.isArray(info.inputModalities)) {
-          if (!info.inputModalities.includes("image")) {
-            return {
-              ...info,
-              inputModalities: [...info.inputModalities, "image"]
-            };
-          }
-        }
-        return info;
-      };
-
-      llm.resolveModelInfo = patchedResolveModelInfo;
-      this.unpatchers.push(() => {
-        llm.resolveModelInfo = origResolveModelInfo;
-      });
+        });
+      }
     }
   }
 }
+
+(MultimodalBridgeService as any)[Symbol.for("cordis.provide")] = "multimodal-bridge";
 
 export default MultimodalBridgeService;
 export { projectMessagesForTarget, projectContentForTarget, defaultSupportsVision } from "./projection.js";
