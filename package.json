@@ -21,8 +21,7 @@
     "build": "tsc",
     "pretest": "tsc",
     "test": "node test/bridge.test.mjs",
-    "prepack": "tsc",
-    "prepare": "tsc"
+    "prepack": "tsc"
   },
   "keywords": [
     "deepseek",
